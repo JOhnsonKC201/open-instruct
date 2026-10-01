@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import hashlib
 import importlib
 import json
 import subprocess
@@ -64,6 +65,18 @@ def test_plan_and_independent_eval_tasks(run):
     assert "eval_interval" not in run.compile().miles
     assert "eval_prompt_data" not in run.compile().miles
     assert RunSpec.from_dict(run.to_dict()).evaluation == run.evaluation
+
+
+def test_background_jobs_restart_after_preemption(run):
+    receipt = {
+        "evaluation": evaluation.runtime(run, run.compile().miles),
+        "training": {"name": run.name},
+        "update": 2,
+        "runner_sha256": hashlib.sha256(Path(evaluation_runner.__file__).read_bytes()).hexdigest(),
+    }
+    task = evaluation.specification(receipt)["tasks"][0]
+    assert task["context"] == {"priority": "high", "autoResume": True}
+    assert "minRuntime" not in task["context"]
 
 
 @pytest.mark.parametrize(

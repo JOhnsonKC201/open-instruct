@@ -200,7 +200,7 @@ def specification(receipt):
                 "result": {"path": "/output"},
                 "resources": {"gpuCount": config["gpus"], "sharedMemory": "32 GiB"},
                 "constraints": {"cluster": [config["cluster"]]},
-                "context": {"priority": "normal", "autoResume": False},
+                "context": {"priority": "high", "autoResume": True},
                 "timeout": config["timeout"],
                 "envVars": [{"name": name, "secret": secret} for name, secret in config["secrets"].items()],
             }

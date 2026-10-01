@@ -4,8 +4,9 @@ Opt in with `evaluation.mode="background"`. Training captures frozen HF weights,
 then one driver submits independent Beaker jobs in a daemon worker. Evaluation
 never borrows, drains or pauses rollout engines, and shutdown never joins the
 submitter or waits for evaluator jobs. Missing points are expected: a busy
-submitter drops new milestones, failures are not retried, and preemption can
-interrupt submission. Snapshot export is a synchronous trainer collective;
+submitter drops new milestones, submission failures are not retried, and preemption can
+interrupt submission. Submitted evaluator jobs automatically restart after
+preemption. Snapshot export is a synchronous trainer collective;
 checkpoint/collective failures still fail training.
 
 The [large example](../../configs/miles/examples/large.toml) opts into background
@@ -99,6 +100,31 @@ copied to the evaluator's Beaker results: aggregate `scores.json`, olmo-eval
 `metrics.json`, predictions/requests, logs, command/configuration and provenance.
 A failed W&B upload writes `publication.json` and preserves these files.
 
+### Recovery after preemption
+
+Evaluator jobs use high priority, unallocated scheduling, and Beaker auto-resume.
+On restart, the runner checks the existing output provenance against the
+checkpoint, update, tasks/sampling/scoring, evaluator revision/image and server
+configuration. It refuses incompatible results rather than overwriting them.
+A process-owned filesystem lock prevents two evaluators from writing the same
+group and is released when its holder dies.
+
+Tasks execute separately while sharing one inference server. Each successful
+task receives an atomic completion record after predictions and scores validate.
+A restart skips those completed tasks. An unfinished task runs in a new attempt
+directory; its previous partial files remain intact. Native olmo-eval response
+resumption is not assumed, so an interrupted individual task is regenerated.
+`task-results.json` selects only successful attempt directories for validation
+and publication; abandoned attempts cannot introduce duplicate scores.
+
+A fully completed group validates and reuses its results without loading the
+model. A restart after the last task but before the group completion record also
+finishes without loading the model. Publication may be retried, so duplicate
+W&B points remain possible. Existing flat, completed result directories are
+accepted only after the same artifact/coverage checks. These changes apply to
+new submissions carrying the updated runner; retrying an old Beaker spec still
+runs its old embedded runner.
+
 The runner rejects missing prediction files and empty `model_output` lists before
 declaring evaluation complete. Some evaluator provider failures can otherwise
 appear as zero scores with no failed-instance count. A returned EOS-only completion
@@ -147,7 +173,9 @@ python -m open_instruct.miles.evaluation.evaluation resubmit RECEIPT.json
 
 This creates a new receipt and results group, retaining the original diagnostic.
 It requires the committed runner source matching `runner_sha256`, the recorded
-image, secrets, mounts and completed snapshot. There are no automatic retries.
+image, secrets, mounts and completed snapshot. Submission/application failures
+are not automatically resubmitted; Beaker auto-resume handles preemption within
+an already submitted experiment.
 
 Snapshots are excluded from ordinary checkpoint retention and result collection.
 There are no pins, leases, automatic deletion or retention controller. Manually

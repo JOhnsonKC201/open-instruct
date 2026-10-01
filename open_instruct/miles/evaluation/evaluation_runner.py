@@ -6,6 +6,8 @@ SGLang/olmo-sglang runtime. No training imports or credentials are transported.
 """
 
 import argparse
+import fcntl
+import hashlib
 import importlib
 import json
 import math
@@ -15,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request
@@ -62,9 +65,21 @@ def command(receipt, output):
     return [*args, "--output-dir", str(output), "--save-predictions", "--save-requests"]
 
 
+def result_roots(output):
+    """Read only committed task attempts, not abandoned or incomplete attempts."""
+    output = Path(output)
+    index = output / "task-results.json"
+    if not index.exists():
+        return [output]
+    roots = [output / name for name in json.loads(index.read_text())]
+    if not roots or any(not root.resolve().is_relative_to(output.resolve()) for root in roots):
+        raise ValueError("Invalid evaluation task-results paths")
+    return roots
+
+
 def validate_predictions(output):
     """Reject provider failures that the harness can encode as empty output lists."""
-    paths = list(Path(output).rglob("*-predictions.jsonl"))
+    paths = [path for root in result_roots(output) for path in root.rglob("*-predictions.jsonl")]
     if not paths:
         raise ValueError("No evaluation predictions found")
     for path in paths:
@@ -80,16 +95,16 @@ def validate_predictions(output):
 
 def scores(output):
     """Read the pinned olmo-eval metrics schema, without treating failures as zero."""
-    files = list(Path(output).rglob("metrics.json"))
+    files = [path for root in result_roots(output) for path in root.rglob("metrics.json")]
     if not files:
         raise ValueError("No olmo-eval metrics.json found")
-    if any(Path(output).rglob("*-predictions.jsonl")):
+    if any(path for root in result_roots(output) for path in root.rglob("*-predictions.jsonl")):
         validate_predictions(output)
     values = {}
     for path in files:
         payload = json.loads(path.read_text())
         for task in payload["tasks"]:
-            if task.get("error_summary") or task.get("instances_saved") == 0:
+            if task.get("error_summary") or task.get("instances_failed") or task.get("instances_saved") == 0:
                 continue
             for metric, scorers in task["metrics"].items():
                 for scorer, score in scorers.items():
@@ -177,12 +192,110 @@ def try_publish(receipt, output, **kwargs):
     return True
 
 
-def run_evaluation(receipt):
+def resume_identity(receipt):
+    """Scheduling and publication metadata may change; evaluated inputs may not."""
+    config = receipt["evaluation"]
+    return {
+        **{key: receipt[key] for key in ("checkpoint", "update", "group_id", "tasks")},
+        "evaluator": {key: config.get(key) for key in ("revision", "image", "gpus", "server_args", "worker")},
+    }
+
+
+@contextmanager
+def evaluation_output(receipt):
     output = result_directory(receipt)
-    output.mkdir(parents=True, exist_ok=False)
-    write_json(output / "provenance.json", receipt)
+    output.mkdir(parents=True, exist_ok=True)
+    # A kernel-owned lock is released after SIGKILL/preemption, unlike a PID file.
+    # Never unlink it: another process may already have the same inode open.
+    with (output / ".runner.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(f"Another evaluator owns {output}") from error
+        provenance = output / "provenance.json"
+        if provenance.exists():
+            if resume_identity(json.loads(provenance.read_text())) != resume_identity(receipt):
+                raise ValueError("Existing evaluation results belong to different inputs; use a fresh output path")
+        elif any(path.name != ".runner.lock" for path in output.iterdir()):
+            raise ValueError("Existing evaluation output has no provenance; refusing to overwrite it")
+        else:
+            write_json(provenance, receipt)
+        yield output
+
+
+def completed_scores(output, tasks):
+    """A success marker alone cannot establish that every requested task finished."""
+    validate_predictions(output)
+    values = scores(output)
+    missing = [task["task"] for task in tasks if not any(k.startswith(f"eval/{task['task']}/") for k in values)]
+    if missing:
+        raise ValueError(f"Evaluation has no successful scores for requested tasks: {missing}")
+    return values
+
+
+def saved_task(output, task):
+    key = hashlib.sha256(json.dumps(task, sort_keys=True).encode()).hexdigest()[:16]
+    directory = output / "tasks" / key
+    marker = directory / "complete.json"
+    if not marker.exists():
+        return directory, None
+    saved = json.loads(marker.read_text())
+    if saved["task"] != task:
+        raise ValueError("Completed task provenance mismatch")
+    attempt = directory / saved["attempt"]
+    if not attempt.resolve().is_relative_to(directory.resolve()):
+        raise ValueError("Invalid completed task path")
+    if completed_scores(attempt, [task]) != saved["scores"]:
+        raise ValueError("Completed task scores changed")
+    return directory, attempt
+
+
+def run_tasks(receipt, output):
+    completed = []
+    for task in receipt["tasks"]:
+        directory, attempt = saved_task(output, task)
+        if attempt is None:
+            # olmo-eval has no response-level resume contract here. Keep partial
+            # attempts intact and rerun only this unfinished task in a fresh path.
+            attempt = directory / "attempts" / uuid.uuid4().hex
+            attempt.mkdir(parents=True)
+            args = command({**receipt, "tasks": [task]}, attempt)
+            write_json(attempt / "command.json", args)
+            with (attempt / "olmo-eval.log").open("w") as log:
+                subprocess.run(args, stdout=log, stderr=subprocess.STDOUT, check=True)
+            values = completed_scores(attempt, [task])
+            write_json(
+                directory / "complete.json",
+                {"task": task, "attempt": str(attempt.relative_to(directory)), "scores": values},
+            )
+        else:
+            print(f"Reusing completed evaluation task: {task['task']}", flush=True)
+        completed.append(str(attempt.relative_to(output)))
+    write_json(output / "task-results.json", completed)
+
+
+def run_evaluation(receipt):
+    with evaluation_output(receipt) as output:
+        run_evaluation_locked(receipt, output)
+
+
+def run_evaluation_locked(receipt, output):
     server = None
     try:
+        status = output / "evaluation.json"
+        if status.exists() and json.loads(status.read_text()).get("status") == "complete":
+            completed_scores(output, receipt["tasks"])
+            print(f"Reusing completed evaluation: {output}", flush=True)
+            try_publish(receipt, output)
+            return
+        # Discover completions before starting an expensive inference server.
+        pending = [task for task in receipt["tasks"] if saved_task(output, task)[1] is None]
+        if not pending:
+            run_tasks(receipt, output)
+            write_json(output / "scores.json", completed_scores(output, receipt["tasks"]))
+            write_json(output / "evaluation.json", {"status": "complete"})
+            try_publish(receipt, output)
+            return
         revision = subprocess.check_output(
             ["git", "-C", "/opt/olmo-eval", "rev-parse", "HEAD"], text=True, timeout=10
         ).strip()
@@ -210,7 +323,7 @@ def run_evaluation(receipt):
             str(receipt["evaluation"]["gpus"]),
             *receipt["evaluation"]["server_args"],
         ]
-        with (output / "server.log").open("w") as log:
+        with (output / "server.log").open("a") as log:
             server = subprocess.Popen(server_args, env=env, stdout=log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 600
         while True:
@@ -225,12 +338,8 @@ def run_evaluation(receipt):
             if time.monotonic() >= deadline:
                 raise TimeoutError("Evaluator SGLang startup timeout")
             time.sleep(1)
-        args = command(receipt, output)
-        write_json(output / "command.json", args)
-        with (output / "olmo-eval.log").open("w") as log:
-            subprocess.run(args, stdout=log, stderr=subprocess.STDOUT, check=True)
-        validate_predictions(output)
-        aggregate = scores(output)
+        run_tasks(receipt, output)
+        aggregate = completed_scores(output, receipt["tasks"])
         write_json(output / "scores.json", aggregate)
         write_json(output / "evaluation.json", {"status": "complete"})
         try_publish(receipt, output)
